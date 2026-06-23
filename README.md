@@ -1,76 +1,96 @@
-# Skool Video Capture
+# Skool Video Capture (v2.0)
 
-A Chrome extension that captures video stream URLs from Skool.com courses. Fully local — no servers, no accounts, no data leaves your browser.
+Chrome extension that captures video stream URLs from Skool.com courses and downloads them via **yt-dlp** through a Native Messaging bridge.
 
-## What It Does
+## Architecture
 
-- Monitors network requests on Skool.com pages
-- Detects HLS streams (.m3u8), direct video files (.mp4, .webm), and embedded videos (Loom, Vimeo, Wistia, YouTube, Cloudflare Stream)
-- Shows captured URLs in a popup
-- Downloads MP4/WebM files directly via Chrome's download API
-- Copies HLS stream URLs to clipboard for use with yt-dlp or ffmpeg
+```
+┌─────────────┐     ┌──────────────┐     ┌─────────────┐     ┌──────────┐
+│  popup.js   │ ←─→ │ background.js│ ←─→ │ engine.py   │ ←─→ │ yt-dlp   │
+│  (popup UI) │     │ (sniffer +   │     │ (native msg │     │ (download)│
+│             │     │  bridge)     │     │  host)      │     │          │
+└─────────────┘     └──────────────┘     └─────────────┘     └──────────┘
+                                               │
+                                        stdout/stdin
+                                        (binary-framed JSON)
+```
+
+- The extension sniffs web requests on Skool.com and captures video URLs
+- Background service worker communicates with a Python native host via `chrome.runtime.connectNative`
+- The native host (`engine.py`) runs `yt-dlp` with the page's own User-Agent and Origin headers
+- yt-dlp downloads HLS streams (.m3u8), MP4 files, and MPEG-DASH (.mpd) directly
 
 ## Installation
 
-1. Open Chrome and go to `chrome://extensions`
-2. Toggle **Developer mode** ON (top right)
+### 1. Install the extension
+
+1. Go to `chrome://extensions`
+2. Turn on **Developer mode**
 3. Click **Load unpacked**
-4. Select this folder
+4. Select the `skool-video-capture` folder
 
-The green icon appears in your toolbar.
+### 2. Install the native messaging host (Windows)
 
-## How to Use
+1. Install Python 3 and yt-dlp:
+   ```
+   pip install yt-dlp
+   ```
 
-1. Open a Skool course page and play a video
-2. Click the extension icon in your toolbar
-3. The captured stream URL appears in the popup
-4. Click **Download MP4** for direct video files
-5. For HLS streams (.m3u8), click **Copy URL** and use one of:
+2. Open `native-bridge/com.generic_bridge.engine.json` and **edit the extension ID**:
+   - Go to `chrome://extensions`
+   - Find "Skool Video Capture"
+   - Copy the ID (looks like `abcdefghijklmnopabcdefghijklmnop`)
+   - Replace `EXTENSION_ID_PLACEHOLDER` in the JSON file
 
-```bash
-# Option 1: yt-dlp (recommended)
-yt-dlp -o video.mp4 "https://...m3u8"
+3. Open **PowerShell as Administrator** and run:
+   ```
+   cd native-bridge
+   powershell -ExecutionPolicy Bypass -File install-host.ps1
+   ```
+   Paste the extension ID when prompted.
 
-# Option 2: ffmpeg
-ffmpeg -i "https://...m3u8" -c copy video.mp4
-```
+4. Reload the extension: `chrome://extensions` → click the refresh icon
 
-## Manual Entry
+### 3. Verify it works
 
-If auto-capture misses a URL, paste it into the **Manual Entry** field and click **Track URL**.
+Click the extension icon → the popup shows a green status. Open a Skool course, play a video, and the URL is captured. Click **Download with yt-dlp**.
+
+The video saves to your Downloads folder.
 
 ## Files
 
 | File | Purpose |
 |------|---------|
-| `manifest.json` | Extension config, permissions, entry points |
-| `background.js` | Service worker — network sniffer, URL capture, storage |
-| `popup.html` | Popup UI |
-| `popup.js` | Popup logic — display, download, copy |
-| `icon-*.png` | Toolbar icons (16px, 48px, 128px) |
+| `manifest.json` | Extension config, permissions |
+| `background.js` | Service worker — sniffer + native bridge |
+| `popup.html` / `popup.js` | Popup UI |
+| `native-bridge/engine.py` | Native messaging host — runs yt-dlp |
+| `native-bridge/engine.bat` | Windows batch wrapper for engine.py |
+| `native-bridge/com.generic_bridge.engine.json` | Native messaging manifest |
+| `native-bridge/install-host.ps1` | PowerShell script to register the host |
 
-## Permissions Explained
+## Permissions
 
 | Permission | Why |
 |-----------|-----|
-| `webRequest` | Monitors network requests to detect video URLs |
-| `downloads` | Saves captured video files to your Downloads folder |
-| `activeTab` | Gets the current tab ID to associate captures |
-| `storage` | Persists captured URLs across service worker restarts |
-| `clipboardWrite` | Copies HLS URLs to clipboard |
-| `host_permissions` | Skool.com + video CDNs (Loom, Vimeo, Wistia, etc.) |
+| `webRequest` | Sniff network requests to detect video URLs |
+| `nativeMessaging` | Talk to engine.py to run yt-dlp |
+| `storage` | Persist captured URLs across service worker restarts |
+| `clipboardWrite` | Copy URLs to clipboard |
 
 ## Troubleshooting
 
-**No URL captured?**
-- Make sure you actually clicked Play on the video
-- Reload the page and try again
-- Check the Chrome extension console for errors (chrome://extensions → Inspect views: service worker)
+**"Native host not detected" in popup:**
+- Make sure you ran `install-host.ps1` as Administrator
+- Check the extension ID in `com.generic_bridge.engine.json` matches `chrome://extensions`
+- Restart Chrome and reload the extension
 
-**Download fails?**
-- HLS streams (.m3u8) can't be downloaded directly — use the Copy URL button + yt-dlp
-- Signed URLs expire — download promptly after capturing
-- Check that the URL hasn't expired (captured over 30 min ago)
+**yt-dlp fails:**
+- Open `native-bridge/debug_bridge.log` to see error details
+- Make sure yt-dlp is installed: `pip install yt-dlp`
+- Test manually: `yt-dlp "URL_HERE"`
 
-**Service worker keeps dying?**
-- This is normal MV3 behavior. Captured URLs are persisted to chrome.storage.local and restored on restart.
+**No URL captured:**
+- Click Play on the video first
+- Reload the Skool page and try again
+- Check the service worker console: `chrome://extensions` → Inspect views: service worker

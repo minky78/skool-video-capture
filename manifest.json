@@ -1,9 +1,9 @@
 {
   "manifest_version": 3,
   "name": "Skool Video Capture",
-  "version": "1.1.0",
-  "description": "Capture video stream URLs from Skool.com courses — fully local, no servers, no accounts.",
-  "homepage_url": "https://github.com/your-local/skool-video-capture",
+  "version": "2.0.0",
+  "description": "Capture video stream URLs from Skool.com courses and download via yt-dlp Native Messaging host.",
+  "homepage_url": "https://github.com/minky78/skool-video-capture",
   "icons": {
     "16": "icon-16.png",
     "48": "icon-48.png",
@@ -14,7 +14,8 @@
     "downloads",
     "activeTab",
     "storage",
-    "clipboardWrite"
+    "clipboardWrite",
+    "nativeMessaging"
   ],
   "host_permissions": [
     "https://*.skool.com/*",

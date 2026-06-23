@@ -1,8 +1,7 @@
 // ═══════════════════════════════════════════════════════════════════════════
-//  Skool Video Capture — Popup Script (v1.1)
-//  Talks to the background service worker to fetch captured stream URLs
-//  and triggers chrome.downloads.download for MP4 files.
-//  For HLS streams, provides Copy URL for use with yt-dlp/ffmpeg.
+//  Skool Video Capture — Popup Script (v2.0)
+//  Displays captured video, triggers native bridge download via background,
+//  and shows real-time progress from the yt-dlp native host.
 // ═══════════════════════════════════════════════════════════════════════════
 
 (function () {
@@ -41,95 +40,56 @@
     return d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
   }
 
-  // ─── Derive filename from URL ───────────────────────────────────────────
-  function deriveFilename(url) {
-    try {
-      const u = new URL(url);
-      const path = u.pathname;
-      // Grab the last path segment
-      let name = path.split("/").filter(Boolean).pop() || "skool-video";
-      // Remove query params if any snuck in
-      name = name.split("?")[0];
-      // If it's an m3u8, rename to .mp4 so download is playable
-      if (name.endsWith(".m3u8")) {
-        name = name.replace(/\.m3u8$/i, ".mp4");
-      }
-      // Ensure we have an extension
-      if (!/\.(mp4|webm|mkv|avi|mov|ts)$/i.test(name)) {
-        name += ".mp4";
-      }
-      return name;
-    } catch {
-      return "skool-video.mp4";
-    }
-  }
-
   // ─── Copy URL to clipboard ──────────────────────────────────────────────
   async function copyUrlToClipboard(url) {
     try {
       await navigator.clipboard.writeText(url);
       showToast("📋 URL copied to clipboard", false);
     } catch (err) {
-      // Fallback: ask background to copy
       try {
-        const resp = await chrome.runtime.sendMessage({
-          action: "copyToClipboard",
-          url: url,
-        });
-        if (resp?.success) {
-          showToast("📋 URL copied to clipboard", false);
-        } else {
-          showToast("❌ Copy failed — select the URL text manually", true);
-        }
-      } catch (err2) {
-        showToast("❌ Copy failed: " + err2.message, true);
+        const resp = await chrome.runtime.sendMessage({ action: "copyToClipboard", url });
+        if (resp?.success) showToast("📋 URL copied to clipboard", false);
+        else showToast("❌ Copy failed", true);
+      } catch {
+        showToast("❌ Copy failed", true);
       }
     }
   }
 
-  // ─── Trigger download via chrome.downloads.download ────────────────────
+  // ─── Trigger download via native bridge ─────────────────────────────────
   async function triggerDownload(url, label) {
     try {
-      const filename = deriveFilename(url);
-      const isHls = /\.m3u8/i.test(url);
-
-      console.log(`[Popup] Downloading: ${url}`);
-      console.log(`[Popup] Filename: ${filename}`);
-
-      if (isHls) {
-        // chrome.downloads can't download HLS playlists as video.
-        // Instead of saving a useless .m3u8 text file, copy the URL
-        // and show the user how to download with yt-dlp.
-        await copyUrlToClipboard(url);
-        showToast(
-          "📋 HLS URL copied. Use yt-dlp or ffmpeg to download (see hint below).",
-          false
-        );
-        return;
-      }
-
-      await chrome.downloads.download({
+      const resp = await chrome.runtime.sendMessage({
+        action: "triggerDownload",
+        tabId: currentTabId,
         url: url,
-        filename: filename,
-        conflictAction: "uniquify",
-        saveAs: false,
       });
 
-      showToast(`⬇️ Downloading ${filename}`, false);
-
-      // Clear badge after download
-      if (currentTabId) {
-        chrome.action.setBadgeText({ text: "", tabId: currentTabId });
+      if (resp?.event === "DISPATCHED") {
+        showToast(`✅ yt-dlp started — check your Downloads folder`, false);
+      } else if (resp?.event === "ERROR") {
+        showToast(`❌ ${resp.error}`, true);
+      } else {
+        showToast("❌ Download failed to start", true);
       }
-
     } catch (err) {
-      console.error("[Popup] Download failed:", err);
-      showToast(`❌ Download failed: ${err.message}`, true);
+      console.error("[Popup] triggerDownload error:", err);
+      showToast(`❌ ${err.message}`, true);
+    }
+  }
+
+  // ─── Check if native bridge is available ────────────────────────────────
+  async function checkNativeBridge() {
+    try {
+      const resp = await chrome.runtime.sendMessage({ action: "pingNative" });
+      return resp?.event === "pong_sent" || resp?.event === "pong";
+    } catch {
+      return false;
     }
   }
 
   // ─── Render the captured video card ─────────────────────────────────────
-  function renderVideo(entry) {
+  function renderVideo(entry, nativeAvailable) {
     if (!entry) {
       captureDisplay.innerHTML = `
         <div class="empty-state">
@@ -149,15 +109,16 @@
     const time = entry.detectedAt;
     const isHls = /\.m3u8/i.test(url);
 
-    const downloadBtnText = isHls ? "📋 Copy HLS URL" : "⬇ Download MP4";
+    const downloadDisabled = !nativeAvailable ? "disabled" : "";
+    const downloadTooltip = !nativeAvailable ? "title='Native host not installed. See README.'" : "";
 
     captureDisplay.innerHTML = `
       <div class="video-card">
         <div class="source-tag">${escapeHtml(label)}</div>
         <div class="host-label">Host: ${escapeHtml(host)}</div>
         <div class="url-display" title="${escapeHtml(url)}">${escapeHtml(url)}</div>
-        <button class="btn btn-primary" id="downloadBtn">
-          ${downloadBtnText}
+        <button class="btn btn-primary" id="downloadBtn" ${downloadDisabled} ${downloadTooltip}>
+          ⬇ Download with yt-dlp
         </button>
         <button class="btn btn-secondary" id="copyBtn" style="margin-top:6px;">
           📋 Copy URL
@@ -165,11 +126,16 @@
         <button class="btn btn-danger" id="clearBtn" style="margin-top:6px;">
           ✕ Clear
         </button>
-        ${isHls ? `
+        ${!nativeAvailable ? `
           <div class="hint-box" style="margin-top:8px;font-size:11px;color:var(--text-dim);background:rgba(0,0,0,0.3);padding:8px;border-radius:4px;">
-            <strong>HLS stream detected.</strong><br>
-            yt-dlp -o video.mp4 "${escapeHtml(url)}"<br>
-            or: ffmpeg -i "${escapeHtml(url)}" -c copy video.mp4
+            <strong>Native host not detected.</strong><br>
+            Run <code>native-bridge\\install-host.ps1</code> as Admin.<br>
+            Or copy the URL and use yt-dlp manually.
+          </div>
+        ` : ''}
+        ${isHls && nativeAvailable ? `
+          <div class="hint-box" style="margin-top:8px;font-size:11px;color:var(--text-dim);background:rgba(0,0,0,0.3);padding:8px;border-radius:4px;">
+            <strong>HLS stream</strong> — yt-dlp will download and merge.
           </div>
         ` : ''}
       </div>
@@ -178,28 +144,16 @@
     statusDot.className = "status-dot";
     captureTime.textContent = `Captured ${formatTime(time)}`;
 
-    // Wire up download/copy button
     document.getElementById("downloadBtn").addEventListener("click", () => {
       triggerDownload(url, label);
     });
-
-    // Wire up copy URL button
     document.getElementById("copyBtn").addEventListener("click", () => {
       copyUrlToClipboard(url);
     });
-
-    // Wire up clear button
     document.getElementById("clearBtn").addEventListener("click", async () => {
       if (currentTabId) {
-        try {
-          await chrome.runtime.sendMessage({
-            action: "clearCapture",
-            tabId: currentTabId,
-          });
-        } catch (err) {
-          // non-fatal
-        }
-        renderVideo(null);
+        try { await chrome.runtime.sendMessage({ action: "clearCapture", tabId: currentTabId }); } catch {}
+        renderVideo(null, nativeAvailable);
         showToast("Cleared capture", false);
       }
     });
@@ -207,9 +161,9 @@
 
   // ─── Simple HTML escape ────────────────────────────────────────────────
   function escapeHtml(str) {
-    const div = document.createElement("div");
-    div.textContent = str;
-    return div.innerHTML;
+    const d = document.createElement("div");
+    d.textContent = str;
+    return d.innerHTML;
   }
 
   // ─── Refresh from background ────────────────────────────────────────────
@@ -217,7 +171,7 @@
     const tab = await getActiveTab();
     if (!tab) {
       tabInfo.textContent = "No active tab";
-      renderVideo(null);
+      renderVideo(null, false);
       return;
     }
 
@@ -228,20 +182,21 @@
       ? `Tab: ${currentTabId} — ${tab.title?.substring(0, 40) || "Skool"}`
       : `Tab: ${currentTabId} — not a Skool page`;
 
+    // Check native bridge availability
+    const nativeAvailable = await checkNativeBridge();
+
     try {
       const resp = await chrome.runtime.sendMessage({
         action: "getCapturedVideo",
         tabId: currentTabId,
       });
-      renderVideo(resp?.video || null);
-
+      renderVideo(resp?.video || null, nativeAvailable);
       if (resp?.video) {
         tabInfo.textContent = `Tab: ${currentTabId} — video found`;
       }
     } catch (err) {
-      // Service worker might not be ready yet
       console.warn("[Popup] Could not reach background:", err);
-      renderVideo(null);
+      renderVideo(null, nativeAvailable);
     }
   }
 
@@ -255,7 +210,6 @@
     const url = manualUrl.value.trim();
     if (!url) return;
 
-    // Crude but effective label detection
     let label = "Manual Entry";
     if (/\.m3u8/i.test(url)) label = "Manual HLS (.m3u8)";
     else if (/\.mp4/i.test(url)) label = "Manual MP4";
@@ -269,8 +223,8 @@
       await chrome.runtime.sendMessage({
         action: "injectManualUrl",
         tabId: currentTabId,
-        url: url,
-        label: label,
+        url,
+        label,
       });
       manualUrl.value = "";
       manualInjectBtn.disabled = true;
@@ -281,16 +235,11 @@
     }
   });
 
-  // Enter key in manual URL field = inject
   manualUrl.addEventListener("keydown", (e) => {
     if (e.key === "Enter" && !manualInjectBtn.disabled) {
       manualInjectBtn.click();
     }
   });
 
-  // ─── Init ───────────────────────────────────────────────────────────────
   document.addEventListener("DOMContentLoaded", refresh);
-
-  // Also refresh manually in case the popup stays open while user switches tabs
-  // (chrome auto-closes popup on tab switch, but just in case)
 })();
