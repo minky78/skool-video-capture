@@ -55,8 +55,9 @@ const STREAM_PATTERNS = [
   // Native S3 / signed HLS (used heavily by Skool's own video player)
   { test: /\.m3u8(\?|$)/i,        label: "HLS Stream (.m3u8)" },
 
-  // Video fragments (.ts, .m4s) — when we see one we try to derive the parent m3u8
-  { test: /\.ts(\?|$)/i,          label: "Video Segment (.ts)" },
+  // Video fragments (.ts, .m4s) — matched more strictly to avoid TypeScript false positives
+  // .ts video segments typically have "segment", "seq", or a numeric pattern
+  { test: /\/[^/]*(segment|seq|chunk|\d{4,}|output_\d+)\.ts(\?|$)/i,  label: "Video Segment (.ts)" },
   { test: /\.m4s(\?|$)/i,         label: "Video Segment (.m4s)" },
 
   // Direct MP4 or WebM video files
