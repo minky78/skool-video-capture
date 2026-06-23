@@ -1,0 +1,48 @@
+{
+  "manifest_version": 3,
+  "name": "Skool Video Capture",
+  "version": "1.1.0",
+  "description": "Capture video stream URLs from Skool.com courses — fully local, no servers, no accounts.",
+  "homepage_url": "https://github.com/your-local/skool-video-capture",
+  "icons": {
+    "16": "icon-16.png",
+    "48": "icon-48.png",
+    "128": "icon-128.png"
+  },
+  "permissions": [
+    "webRequest",
+    "downloads",
+    "activeTab",
+    "storage",
+    "clipboardWrite"
+  ],
+  "host_permissions": [
+    "https://*.skool.com/*",
+    "https://*.loom.com/*",
+    "https://*.vimeo.com/*",
+    "https://*.vimeocdn.com/*",
+    "https://*.wistia.com/*",
+    "https://*.wistia.net/*",
+    "https://*.googlevideo.com/*",
+    "https://*.cloudflarestream.com/*",
+    "https://*.akamaized.net/*",
+    "https://*.cloudfront.net/*",
+    "https://*.amazonaws.com/*"
+  ],
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "Skool Video Capture",
+    "default_icon": {
+      "16": "icon-16.png",
+      "48": "icon-48.png",
+      "128": "icon-128.png"
+    }
+  },
+  "content_security_policy": {
+    "extension_pages": "script-src 'self'; object-src 'self'"
+  }
+}
