@@ -1,0 +1,7 @@
+{
+  "name": "com.generic_bridge.engine",
+  "description": "Native messaging host for Skool Video Capture — runs yt-dlp to download HLS/MP4 streams",
+  "path": "C:\\Users\\User\\Desktop\\skool-video-downloader\\native-bridge\\engine.bat",
+  "type": "stdio",
+  "allowed_origins": ["chrome-extension://EXTENSION_ID_PLACEHOLDER/"]
+}
