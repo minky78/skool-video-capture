@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "Skool Video Capture",
-  "version": "2.0.0",
-  "description": "Capture video stream URLs from Skool.com courses and download via yt-dlp Native Messaging host.",
+  "version": "3.0.0",
+  "description": "Capture and download video streams from Skool.com — per-platform detection, quality selection, download manager.",
   "homepage_url": "https://github.com/minky78/skool-video-capture",
   "icons": {
     "16": "icon-16.png",
@@ -11,11 +11,11 @@
   },
   "permissions": [
     "webRequest",
-    "downloads",
     "activeTab",
     "storage",
-    "clipboardWrite",
-    "nativeMessaging"
+    "nativeMessaging",
+    "scripting",
+    "tabs"
   ],
   "host_permissions": [
     "https://*.skool.com/*",
@@ -28,12 +28,27 @@
     "https://*.cloudflarestream.com/*",
     "https://*.akamaized.net/*",
     "https://*.cloudfront.net/*",
-    "https://*.amazonaws.com/*"
+    "https://*.amazonaws.com/*",
+    "https://*.youtube.com/*"
   ],
   "background": {
     "service_worker": "background.js",
     "type": "module"
   },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://*.skool.com/*",
+        "https://*.loom.com/*",
+        "https://*.vimeo.com/*",
+        "https://*.wistia.com/*",
+        "https://*.youtube.com/*"
+      ],
+      "js": ["inject-main.js"],
+      "run_at": "document_start",
+      "all_frames": true
+    }
+  ],
   "action": {
     "default_popup": "popup.html",
     "default_title": "Skool Video Capture",

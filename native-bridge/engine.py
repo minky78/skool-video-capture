@@ -130,20 +130,35 @@ def build_ytdlp_args(
     url: str,
     request_headers: Dict[str, str],
     output_dir: str,
+    quality: str = "best",
 ) -> list:
     """
     Build the yt-dlp command argument list.
 
     Headers from the browser payload are applied via --add-header dynamically.
-    The output template sends files into the user-configured directory.
+    Quality parameter maps to yt-dlp format selection:
+      - "best" or "bestvideo+bestaudio/best" → -f "bestvideo+bestaudio/best"
+      - "1080p" / "720p" / "480p" / "360p" → -f "bestvideo[height<=N]+bestaudio/best[height<=N]"
     """
+    # Resolve quality flag
+    q_map = {
+        "1080": "bestvideo[height<=1080]+bestaudio/best[height<=1080]",
+        "720": "bestvideo[height<=720]+bestaudio/best[height<=720]",
+        "480": "bestvideo[height<=480]+bestaudio/best[height<=480]",
+        "360": "bestvideo[height<=360]+bestaudio/best[height<=360]",
+        "bestvideo+bestaudio/best": "bestvideo+bestaudio/best",
+    }
+    format_str = q_map.get(str(quality).strip().rstrip("p"), "bestvideo+bestaudio/best")
+    if quality == "best":
+        format_str = "bestvideo+bestaudio/best"
+
     args = [
         "yt-dlp",
         "--no-progress",
         "--newline",
         "--progress-template",
         "PROGRESS|%(progress._percent_str)s|%(progress._speed_str)s|%(progress._eta_str)s|%(progress._total_bytes)s|%(progress._downloaded_bytes)s",
-        "-f", "bestvideo+bestaudio/best",
+        "-f", format_str,
         "--merge-output-format", "mp4",
         "-P", output_dir,
         "-o", "%(title)s [%(id)s].%(ext)s",
@@ -251,6 +266,7 @@ def run_download(
     url: str,
     request_headers: Dict[str, str],
     output_dir: str,
+    quality: str = "best",
 ) -> None:
     """
     Execute yt-dlp on a background thread, streaming PROGRESS packets back
@@ -265,7 +281,7 @@ def run_download(
         })
         return
 
-    args = build_ytdlp_args(url, request_headers, output_dir)
+    args = build_ytdlp_args(url, request_headers, output_dir, quality)
     args[0] = ytdlp_path  # use absolute path for safety
 
     log_debug(f"Spawning: {' '.join(args)}")
@@ -365,6 +381,8 @@ def handle_execute_download(message: Dict[str, Any]) -> Dict[str, Any]:
     if not isinstance(request_headers, dict):
         request_headers = {}
 
+    quality = str(message.get("quality") or "best").strip()
+
     output_dir = str(message.get("output_dir") or OUTPUT_DIR)
     try:
         Path(output_dir).mkdir(parents=True, exist_ok=True)
@@ -381,7 +399,7 @@ def handle_execute_download(message: Dict[str, Any]) -> Dict[str, Any]:
 
     thread = threading.Thread(
         target=run_download,
-        args=(url, request_headers, output_dir),
+        args=(url, request_headers, output_dir, quality),
         daemon=True,
         name=f"ytdlp-{int(time.time())}"
     )

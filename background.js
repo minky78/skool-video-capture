@@ -1,31 +1,27 @@
 // ═══════════════════════════════════════════════════════════════════════════
-//  Skool Video Capture — Background Service Worker (v2.0)
-//  Network sniffer + Native Messaging bridge to yt-dlp.
-//  Detects HLS/MP4/MPD streams, captures page context headers,
-//  and delegates actual downloads to engine.py via Native Messaging.
+//  Skool Video Capture — Background Service Worker (v3.0)
+//  Per-platform content script detection + webRequest sniffer + Native bridge.
+//  Handles PAGE_VIDEO_DETECTED from inject-main.js for metadata extraction.
 // ═══════════════════════════════════════════════════════════════════════════
 
-// ─── Config ───────────────────────────────────────────────────────────────
 const EXTENSION_NAME = "Skool Video Capture";
-const STORAGE_KEY = "capturedVideos";
+const STORAGE_KEY_CAPTURES = "capturedVideos";
+const STORAGE_KEY_DOWNLOADS = "downloadQueue";
 const POISON_EXPIRY_MS = 30 * 60 * 1000;
 const GC_INTERVAL_MS = 2 * 60 * 1000;
-const NATIVE_HOST_NAME = "com.generic_bridge.engine";
+const NATIVE_HOST = "com.generic_bridge.engine";
 
-// ─── Captured video registry ──────────────────────────────────────────────
-let capturedVideos = new Map();
-// Latest status from native bridge downloads (keyed by URL)
-let downloadStatus = new Map();
-
-// Native messaging port reference
+// ─── Registries ───────────────────────────────────────────────────────────
+let capturedVideos = new Map();   // tabId → video entry
+let downloadQueue = new Map();    // downloadId → download status
 let nativePort = null;
 
-// ─── Load persisted state from storage ────────────────────────────────────
+// ─── Persistence ──────────────────────────────────────────────────────────
 async function loadFromStorage() {
   try {
-    const data = await chrome.storage.local.get(STORAGE_KEY);
-    if (data[STORAGE_KEY]) {
-      const entries = JSON.parse(data[STORAGE_KEY]);
+    const data = await chrome.storage.local.get([STORAGE_KEY_CAPTURES, STORAGE_KEY_DOWNLOADS]);
+    if (data[STORAGE_KEY_CAPTURES]) {
+      const entries = JSON.parse(data[STORAGE_KEY_CAPTURES]);
       const now = Date.now();
       for (const [tabIdStr, entry] of Object.entries(entries)) {
         if (now - entry.detectedAt < POISON_EXPIRY_MS) {
@@ -33,24 +29,56 @@ async function loadFromStorage() {
         }
       }
     }
-  } catch (err) {
-    console.warn(`[${EXTENSION_NAME}] Storage load error:`, err);
-  }
-}
-
-async function saveToStorage() {
-  try {
-    const obj = {};
-    for (const [tabId, entry] of capturedVideos) {
-      obj[String(tabId)] = entry;
+    if (data[STORAGE_KEY_DOWNLOADS]) {
+      downloadQueue = new Map(JSON.parse(data[STORAGE_KEY_DOWNLOADS]));
     }
-    await chrome.storage.local.set({ [STORAGE_KEY]: JSON.stringify(obj) });
   } catch (err) {
-    console.warn(`[${EXTENSION_NAME}] Storage save error:`, err);
+    console.warn(`[${EXTENSION_NAME}] Storage load:`, err);
   }
 }
 
-// ─── Stream detection heuristics ──────────────────────────────────────────
+async function saveCaptures() {
+  const obj = {};
+  for (const [tabId, entry] of capturedVideos) obj[String(tabId)] = entry;
+  await chrome.storage.local.set({ [STORAGE_KEY_CAPTURES]: JSON.stringify(obj) });
+}
+
+async function saveDownloads() {
+  await chrome.storage.local.set({ [STORAGE_KEY_DOWNLOADS]: JSON.stringify([...downloadQueue]) });
+}
+
+// ─── Native port management ───────────────────────────────────────────────
+function getNativePort() {
+  if (nativePort) return nativePort;
+  try {
+    nativePort = chrome.runtime.connectNative(NATIVE_HOST);
+    nativePort.onMessage.addListener((msg) => {
+      if (msg.event === "PROGRESS" || msg.event === "FINISHED" || msg.event === "STARTED" || msg.event === "ERROR") {
+        // Forward to popup via storage
+        const status = downloadQueue.get(msg.url) || {};
+        downloadQueue.set(msg.url, { ...status, lastEvent: msg.event, progress: msg });
+        saveDownloads();
+        chrome.runtime.sendMessage({ action: "DOWNLOAD_PROGRESS", data: msg }).catch(() => {});
+      }
+    });
+    nativePort.onDisconnect.addListener(() => {
+      if (chrome.runtime.lastError) console.warn(`[${EXTENSION_NAME}] Native disconnect:`, chrome.runtime.lastError.message);
+      nativePort = null;
+    });
+  } catch (err) {
+    console.error(`[${EXTENSION_NAME}] Native port:`, err);
+    nativePort = null;
+  }
+  return nativePort;
+}
+
+function sendToNative(payload) {
+  const port = getNativePort();
+  if (!port) return false;
+  try { port.postMessage(payload); return true; } catch (err) { return false; }
+}
+
+// ─── Stream patterns for webRequest sniffer ──────────────────────────────
 const STREAM_PATTERNS = [
   { test: /\.m3u8(\?|$)/i,        label: "HLS Stream (.m3u8)" },
   { test: /\.mpd(\?|$)/i,          label: "MPEG-DASH (.mpd)" },
@@ -64,48 +92,37 @@ const STREAM_PATTERNS = [
   { test: /cloudflarestream/i,     label: "Cloudflare Stream" },
 ];
 
-// ─── URL normalisation (safe — does NOT strip auth params) ────────────────
 function normaliseUrl(urlStr) {
   try {
     const u = new URL(urlStr);
-    const safeStripKeys = ["_", "rnd", "cb", "nocache", "random"];
-    const authPatterns = /signature|expires|policy|keypair|token|auth|credential|x-amz/i;
-    u.searchParams.forEach((value, key) => {
-      if (safeStripKeys.includes(key.toLowerCase()) && !authPatterns.test(key)) {
-        u.searchParams.delete(key);
-      }
+    const safe = ["_", "rnd", "cb", "nocache", "random"];
+    const authRe = /signature|expires|policy|keypair|token|auth|credential|x-amz/i;
+    u.searchParams.forEach((v, k) => {
+      if (safe.includes(k.toLowerCase()) && !authRe.test(k)) u.searchParams.delete(k);
     });
     return u.href;
-  } catch {
-    return urlStr;
-  }
+  } catch { return urlStr; }
 }
 
 function extractHost(urlStr) {
   try { return new URL(urlStr).hostname; } catch { return "unknown"; }
 }
 
-// ─── Store a captured URL with its request context headers ────────────────
-async function captureUrl(tabId, url, label, requestHeaders = []) {
+async function captureUrl(tabId, url, label, requestHeaders = [], pageMetadata = null) {
   const normalised = normaliseUrl(url);
   const existing = capturedVideos.get(tabId);
-
   if (existing) {
-    const existingIsBetter = /\.m3u8/i.test(existing.detectedUrl);
-    const incomingIsTs = /\.(ts|m4s)/i.test(normalised);
-    if (existingIsBetter && incomingIsTs) return;
-    const incomingIsBetter = /\.m3u8/i.test(normalised);
-    if (incomingIsBetter && !existingIsBetter) { /* upgrade */ }
+    const eb = /\.m3u8/i.test(existing.detectedUrl);
+    const it = /\.(ts|m4s)/i.test(normalised);
+    if (eb && it) return;
+    if (/\.m3u8/i.test(normalised) && !eb) { /* upgrade */ }
     else return;
   }
 
-  // Extract User-Agent and Origin from request headers
-  let userAgent = "";
-  let origin = "";
+  let ua = "", origin = "";
   for (const h of requestHeaders) {
-    const name = (h.name || "").toLowerCase();
-    if (name === "user-agent") userAgent = h.value || "";
-    if (name === "origin") origin = h.value || "";
+    if ((h.name || "").toLowerCase() === "user-agent") ua = h.value || "";
+    if ((h.name || "").toLowerCase() === "origin") origin = h.value || "";
   }
 
   capturedVideos.set(tabId, {
@@ -113,7 +130,8 @@ async function captureUrl(tabId, url, label, requestHeaders = []) {
     sourceLabel: label,
     detectedAt: Date.now(),
     host: extractHost(normalised),
-    requestHeaders: { "User-Agent": userAgent, "Origin": origin },
+    requestHeaders: { "User-Agent": ua, "Origin": origin },
+    pageMetadata: pageMetadata || null,
   });
 
   try {
@@ -121,14 +139,12 @@ async function captureUrl(tabId, url, label, requestHeaders = []) {
     chrome.action.setBadgeBackgroundColor({ color: "#4CAF50", tabId });
   } catch {}
 
-  await saveToStorage();
-  console.log(`[${EXTENSION_NAME}] Captured on tab ${tabId}: ${label} — ${normalised}`);
+  await saveCaptures();
 }
 
-// ─── Garbage collector ────────────────────────────────────────────────────
+// ─── GC ───────────────────────────────────────────────────────────────────
 setInterval(async () => {
-  const now = Date.now();
-  let changed = false;
+  const now = Date.now(); let changed = false;
   for (const [tabId, entry] of capturedVideos) {
     if (now - entry.detectedAt > POISON_EXPIRY_MS) {
       capturedVideos.delete(tabId);
@@ -136,195 +152,153 @@ setInterval(async () => {
       changed = true;
     }
   }
-  if (changed) await saveToStorage();
+  if (changed) await saveCaptures();
 }, GC_INTERVAL_MS);
 
 // ═══════════════════════════════════════════════════════════════════════════
-//  WEB REQUEST DETECTION (passive sniffer)
+//  WEB REQUEST SNIFFER
 // ═══════════════════════════════════════════════════════════════════════════
-
-// Listener 1: onBeforeSendHeaders — captures video URL + request headers
 chrome.webRequest.onBeforeSendHeaders.addListener(
   (details) => {
-    const tabId = details.tabId;
-    if (tabId < 0) return;
-    const url = details.url;
-
-    for (const pattern of STREAM_PATTERNS) {
-      if (pattern.test.test(url)) {
-        captureUrl(tabId, url, pattern.label, details.requestHeaders || []);
+    if (details.tabId < 0) return;
+    for (const p of STREAM_PATTERNS) {
+      if (p.test.test(details.url)) {
+        captureUrl(details.tabId, details.url, p.label, details.requestHeaders || []);
         break;
       }
     }
   },
   {
     urls: [
-      "https://*.skool.com/*",
-      "https://*.loom.com/*",
-      "https://*.vimeo.com/*",
-      "https://*.vimeocdn.com/*",
-      "https://*.wistia.com/*",
-      "https://*.wistia.net/*",
-      "https://*.googlevideo.com/*",
-      "https://*.cloudflarestream.com/*",
-      "https://*.akamaized.net/*",
-      "https://*.cloudfront.net/*",
-      "https://*.amazonaws.com/*",
+      "https://*.skool.com/*", "https://*.loom.com/*", "https://*.vimeo.com/*",
+      "https://*.vimeocdn.com/*", "https://*.wistia.com/*", "https://*.wistia.net/*",
+      "https://*.googlevideo.com/*", "https://*.cloudflarestream.com/*",
+      "https://*.akamaized.net/*", "https://*.cloudfront.net/*", "https://*.amazonaws.com/*",
     ],
-    types: ["media", "xmlhttprequest", "other", "script", "image"],
+    types: ["media", "xmlhttprequest", "other"],
   },
   ["requestHeaders"]
 );
 
 // ═══════════════════════════════════════════════════════════════════════════
-//  NATIVE MESSAGING — yt-dlp bridge
+//  MESSAGE HANDLER
 // ═══════════════════════════════════════════════════════════════════════════
-
-function getNativePort() {
-  if (nativePort) return nativePort;
-  try {
-    nativePort = chrome.runtime.connectNative(NATIVE_HOST_NAME);
-    nativePort.onMessage.addListener((msg) => {
-      // Forward native host telemetry to any listening popup connections
-      console.log(`[${EXTENSION_NAME}] Native host:`, msg.event, msg);
-      if (msg.event === "FINISHED" || msg.event === "ERROR" || msg.event === "PROGRESS" || msg.event === "STARTED") {
-        downloadStatus.set(msg.url || "unknown", msg);
-        // Broadcast to any popup that has a listener registered
-        chrome.runtime.sendMessage({
-          action: "nativeEvent",
-          event: msg.event,
-          data: msg,
-        }).catch(() => {}); // popup might not be open
-      }
-    });
-    nativePort.onDisconnect.addListener(() => {
-      console.log(`[${EXTENSION_NAME}] Native host disconnected`);
-      if (chrome.runtime.lastError) {
-        console.warn(`[${EXTENSION_NAME}] Disconnect error:`, chrome.runtime.lastError.message);
-      }
-      nativePort = null;
-    });
-  } catch (err) {
-    console.error(`[${EXTENSION_NAME}] Failed to connect native host:`, err);
-    nativePort = null;
-  }
-  return nativePort;
-}
-
-function sendToNative(payload) {
-  const port = getNativePort();
-  if (!port) {
-    console.error(`[${EXTENSION_NAME}] No native port available`);
-    return false;
-  }
-  try {
-    port.postMessage(payload);
-    return true;
-  } catch (err) {
-    console.error(`[${EXTENSION_NAME}] Native postMessage failed:`, err);
-    return false;
-  }
-}
-
-// ═══════════════════════════════════════════════════════════════════════════
-//  MESSAGE HANDLER — communication with popup.js
-// ═══════════════════════════════════════════════════════════════════════════
-
-chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   (async () => {
-    // Get captured video for a tab
-    if (message.action === "getCapturedVideo") {
-      const entry = capturedVideos.get(message.tabId) || null;
-      sendResponse({ video: entry });
-      return;
-    }
+    // Content script detected a video on the page
+    if (msg.action === "PAGE_VIDEO_DETECTED") {
+      const tabId = sender.tab ? sender.tab.id : null;
+      if (!tabId) { sendResponse({ ok: false }); return; }
 
-    // Get all captured videos
-    if (message.action === "getAllCapturedVideos") {
-      const snapshot = Array.from(capturedVideos.entries()).map(([tabId, entry]) => ({
-        tabId,
-        ...entry,
-      }));
-      sendResponse({ videos: snapshot });
-      return;
-    }
+      const v = msg.video;
+      const existing = capturedVideos.get(tabId);
 
-    // Trigger download via native bridge
-    if (message.action === "triggerDownload") {
-      const tabId = message.tabId;
-      const entry = capturedVideos.get(tabId);
-      if (!entry) {
-        sendResponse({ error: "No captured video for this tab" });
-        return;
+      // Merge page metadata into existing sniffer capture, or store as standalone
+      if (existing && existing.sourceLabel && v.platform) {
+        existing.pageMetadata = {
+          platform: v.platform,
+          title: v.title,
+          duration: v.duration,
+          source: v.source,
+          pageUrl: v.pageUrl,
+        };
+        capturedVideos.set(tabId, existing);
+        await saveCaptures();
+      } else if (!existing) {
+        // No sniffer capture yet — store what we know from the page
+        capturedVideos.set(tabId, {
+          detectedUrl: v.url,
+          sourceLabel: `${v.platform} Video`,
+          detectedAt: Date.now(),
+          host: extractHost(v.url),
+          requestHeaders: {},
+          pageMetadata: {
+            platform: v.platform,
+            title: v.title,
+            duration: v.duration,
+            source: v.source,
+            pageUrl: v.pageUrl,
+          },
+        });
+        await saveCaptures();
+        try {
+          chrome.action.setBadgeText({ text: "1", tabId });
+          chrome.action.setBadgeBackgroundColor({ color: "#4CAF50", tabId });
+        } catch {}
       }
 
+      sendResponse({ ok: true });
+      return;
+    }
+
+    if (msg.action === "getCapturedVideo") {
+      sendResponse({ video: capturedVideos.get(msg.tabId) || null });
+      return;
+    }
+
+    if (msg.action === "triggerDownload") {
+      const entry = capturedVideos.get(msg.tabId);
+      if (!entry) { sendResponse({ error: "No captured video for this tab" }); return; }
+
+      const quality = msg.quality || "best";
       const payload = {
         action: "execute_download",
         url: entry.detectedUrl,
         request_headers: entry.requestHeaders || {},
-        output_dir: message.outputDir || undefined,
+        quality: quality,
       };
 
+      downloadQueue.set(entry.detectedUrl, { status: "dispatched", quality, startedAt: Date.now() });
+      await saveDownloads();
+
       const sent = sendToNative(payload);
-      if (sent) {
-        sendResponse({ event: "DISPATCHED", url: entry.detectedUrl });
-      } else {
-        sendResponse({ event: "ERROR", error: "Failed to connect to native host. Is engine.py installed?" });
-      }
+      sendResponse(sent
+        ? { event: "DISPATCHED", url: entry.detectedUrl }
+        : { event: "ERROR", error: "Native host not available" }
+      );
       return;
     }
 
-    // Ping native host to check availability
-    if (message.action === "pingNative") {
-      const sent = sendToNative({ action: "ping" });
-      if (!sent) {
-        sendResponse({ event: "ERROR", error: "Native host not available" });
-      } else {
-        sendResponse({ event: "pong_sent" });
-      }
+    if (msg.action === "cancelDownload") {
+      downloadQueue.delete(msg.url);
+      await saveDownloads();
+      sendResponse({ ok: true });
       return;
     }
 
-    // Query download status
-    if (message.action === "getDownloadStatus") {
-      const status = downloadStatus.get(message.url) || null;
-      sendResponse({ status });
+    if (msg.action === "getDownloadQueue") {
+      sendResponse({ queue: [...downloadQueue.entries()] });
       return;
     }
 
-    // Manual URL injection
-    if (message.action === "injectManualUrl") {
-      const tabId = message.tabId;
-      const url = message.url;
-      const label = message.label || "Manual Entry";
-      await captureUrl(tabId, url, label);
+    if (msg.action === "pingNative") {
+      sendResponse({ event: sendToNative({ action: "ping" }) ? "pong_sent" : "error" });
+      return;
+    }
+
+    if (msg.action === "injectManualUrl") {
+      await captureUrl(msg.tabId, msg.url, msg.label || "Manual Entry");
       sendResponse({ success: true });
       return;
     }
 
-    // Clear capture for a tab
-    if (message.action === "clearCapture") {
-      const tabId = message.tabId;
-      capturedVideos.delete(tabId);
-      try { chrome.action.setBadgeText({ text: "", tabId }); } catch {}
-      await saveToStorage();
+    if (msg.action === "clearCapture") {
+      capturedVideos.delete(msg.tabId);
+      try { chrome.action.setBadgeText({ text: "", tabId: msg.tabId }); } catch {}
+      await saveCaptures();
       sendResponse({ success: true });
       return;
     }
 
     sendResponse({ error: "Unknown action" });
   })();
-  return true; // keep channel open for async response
+  return true;
 });
 
-// ─── Cleanup on tab close ─────────────────────────────────────────────────
+// ─── Tab cleanup ──────────────────────────────────────────────────────────
 chrome.tabs.onRemoved.addListener(async (tabId) => {
-  if (capturedVideos.has(tabId)) {
-    capturedVideos.delete(tabId);
-    await saveToStorage();
-  }
+  if (capturedVideos.has(tabId)) { capturedVideos.delete(tabId); await saveCaptures(); }
 });
 
-// ─── Init ─────────────────────────────────────────────────────────────────
 loadFromStorage();
-console.log(`[${EXTENSION_NAME}] v2.0 loaded. Sniffing streams on *.skool.com`);
+console.log(`[${EXTENSION_NAME}] v3.0 loaded with per-platform detection`);
